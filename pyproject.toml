@@ -9,7 +9,7 @@ description = "Reassemble GoPro chapter files into episodes and pair them with G
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Joe Petrucelli", email = "joepetjr@gmail.com" }]
+authors = [{ name = "Joe Petrucelli", email = "backroadcreativeco@gmail.com" }]
 keywords = ["gopro", "gpmf", "gpx", "gps", "telemetry", "video", "ingest", "ffprobe"]
 classifiers = [
   "Development Status :: 4 - Beta",
