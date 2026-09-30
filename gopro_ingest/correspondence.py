@@ -23,21 +23,38 @@ no track, no video clock, no embedded coordinate. What they will not do is
 treat a *missing* signal as a *passing* one. In particular, a track with no
 location anchor still gets both time checks, because "no embedded tag" is
 precisely the situation a swapped track arrives in.
+
+"Degrade" still means the ``assert_*`` functions return quietly, which a
+caller cannot tell apart from "checked and fine". The ``check_*`` functions
+return a :class:`CorrespondenceResult` that keeps the four outcomes apart
+(matched, mismatched, insufficient evidence, invalid input) and lists which
+checks ran and which were skipped. ``assert_*(..., strict=True)`` raises on
+insufficient evidence for callers that must not publish on an unverified
+pairing. Non-finite or negative timing is never treated as a skipped check:
+NaN makes every comparison false, so it would otherwise pass as a match.
 """
 
 from __future__ import annotations
 
 import datetime
 import logging
+import math
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from .config import DEFAULT_TOLERANCES, CorrespondenceTolerances
 from .gpx import first_real_fix_timestamp, haversine_km, parse_gpx_file
 
 __all__ = [
+    "CorrespondenceResult",
+    "CorrespondenceStatus",
     "GpxCorrespondenceError",
+    "InsufficientCorrespondenceEvidence",
     "assert_gpx_video_correspondence",
     "assert_slice_gpx_correspondence",
+    "check_gpx_video_correspondence",
+    "check_slice_gpx_correspondence",
     "gps_coverage_window",
     "resolve_corresponding_gpx",
 ]
@@ -49,10 +66,226 @@ class GpxCorrespondenceError(RuntimeError):
     """The track does not correspond to the video it was paired with."""
 
 
+class InsufficientCorrespondenceEvidence(GpxCorrespondenceError):
+    """Raised under ``strict=True`` when too little was available to check."""
+
+
+class CorrespondenceStatus(StrEnum):
+    """The four outcomes of a correspondence check."""
+
+    MATCHED = "matched"
+    MISMATCHED = "mismatched"
+    #: Nothing contradicted the pairing, but a required check could not run.
+    INSUFFICIENT = "insufficient"
+    #: The timing inputs themselves are unusable (NaN, infinite, negative, reversed).
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class CorrespondenceResult:
+    """What a correspondence check did, not just whether it raised.
+
+    ``checked`` and ``skipped`` name checks (``"start_time"``, ``"span"``,
+    ``"position"``); ``problems`` holds the human-readable reasons behind a
+    ``MISMATCHED`` or ``INVALID`` status, in check order.
+
+    ``MATCHED`` requires both time checks to have run. The position check is
+    extra evidence: it is listed in ``skipped`` when there is no anchor, but
+    that alone does not make the result ``INSUFFICIENT``.
+    """
+
+    status: CorrespondenceStatus
+    checked: tuple[str, ...] = ()
+    skipped: tuple[str, ...] = ()
+    problems: tuple[str, ...] = ()
+
+    @property
+    def verified(self) -> bool:
+        """True only for ``MATCHED``; insufficient evidence is not verification."""
+        return self.status is CorrespondenceStatus.MATCHED
+
+
+_REQUIRED_CHECKS = ("start_time", "span")
+
+
 def _trackpoints(track) -> list:
     if track is None:
         return []
     return list(getattr(track, "trackpoints", None) or [])
+
+
+def _finite(value) -> bool:
+    try:
+        return math.isfinite(value)
+    except TypeError:
+        return False
+
+
+def _timing_problems(
+    trackpoints: list,
+    video_duration: float | None,
+    embedded_coord: tuple[float, float] | None,
+) -> list[str]:
+    """Reasons the timing inputs cannot be compared at all."""
+    problems: list[str] = []
+    if video_duration is not None and (not _finite(video_duration) or video_duration < 0):
+        problems.append(
+            f"video duration {video_duration!r} is negative or non-finite -- "
+            "refusing to compare against it."
+        )
+    if trackpoints:
+        first_ts = trackpoints[0].timestamp
+        last_ts = trackpoints[-1].timestamp
+        if not _finite(first_ts) or not _finite(last_ts):
+            problems.append("GPX first or last timestamp is missing or non-finite.")
+        elif last_ts < first_ts:
+            problems.append(
+                f"GPX timestamps are reversed (last fix {first_ts - last_ts:.0f}s "
+                "before the first) -- the track is not in time order."
+            )
+    if embedded_coord is not None and not all(_finite(v) for v in embedded_coord):
+        problems.append(f"embedded location {embedded_coord!r} is non-finite.")
+    return problems
+
+
+def _evaluate(
+    track,
+    video_creation_time: datetime.datetime | None,
+    video_duration: float | None,
+    embedded_coord: tuple[float, float] | None,
+    tolerances: CorrespondenceTolerances,
+    *,
+    is_slice: bool,
+) -> CorrespondenceResult:
+    all_checks = _REQUIRED_CHECKS if is_slice else (*_REQUIRED_CHECKS, "position")
+    trackpoints = _trackpoints(track)
+
+    invalid = _timing_problems(trackpoints, video_duration, None if is_slice else embedded_coord)
+    if invalid:
+        return CorrespondenceResult(CorrespondenceStatus.INVALID, (), all_checks, tuple(invalid))
+    if not trackpoints:
+        return CorrespondenceResult(CorrespondenceStatus.INSUFFICIENT, (), all_checks)
+
+    gpx_start = trackpoints[0].timestamp
+    gpx_span = trackpoints[-1].timestamp - gpx_start
+    duration = video_duration or 0.0
+    checked: list[str] = []
+    problems: list[str] = []
+
+    if video_creation_time is not None:
+        checked.append("start_time")
+        start_delta = abs(gpx_start - video_creation_time.timestamp())
+        if start_delta > tolerances.start_time_sec:
+            subject, verdict = (
+                ("Sliced GPX", "the slice looks mis-anchored to its video.")
+                if is_slice
+                else ("GPX", "the track probably belongs to a different recording.")
+            )
+            what = "the slice's" if is_slice else "the video's"
+            problems.append(
+                f"{subject} start-time is off by {start_delta / 60:.0f} min "
+                f"(tolerance {tolerances.start_time_sec / 60:.0f} min) from {what} "
+                f"creation_time -- {verdict}"
+            )
+
+    if duration > 0:
+        checked.append("span")
+        span_tol = max(tolerances.span_abs_sec, tolerances.span_rel * duration)
+        if is_slice:
+            over = gpx_span - duration
+            if over > span_tol:
+                problems.append(
+                    f"Sliced GPX span {gpx_span:.0f}s over-covers video duration "
+                    f"{duration:.0f}s by {over:.0f}s (tolerance {span_tol:.0f}s) -- the "
+                    "slice window reached past its own extent."
+                )
+        else:
+            span_delta = abs(gpx_span - duration)
+            if span_delta > span_tol:
+                problems.append(
+                    f"GPX span {gpx_span:.0f}s diverges from video duration {duration:.0f}s "
+                    f"by {span_delta:.0f}s (tolerance {span_tol:.0f}s) -- the track probably "
+                    "belongs to a different recording."
+                )
+
+    if not is_slice and embedded_coord is not None:
+        elat, elon = embedded_coord
+        flat = trackpoints[0].lat
+        flon = trackpoints[0].lon
+        if flat is None or flon is None:
+            pass
+        elif not (_finite(flat) and _finite(flon)):
+            return CorrespondenceResult(
+                CorrespondenceStatus.INVALID,
+                tuple(checked),
+                tuple(c for c in all_checks if c not in checked),
+                (*problems, "GPX first fix coordinate is non-finite."),
+            )
+        else:
+            checked.append("position")
+            dist_km = haversine_km(flat, flon, elat, elon)
+            if dist_km > tolerances.embedded_coord_radius_km:
+                problems.append(
+                    f"GPX first fix is {dist_km:.0f} km from the video's embedded location "
+                    f"tag (tolerance {tolerances.embedded_coord_radius_km:.0f} km) -- the "
+                    "track probably belongs to a different recording."
+                )
+
+    skipped = tuple(c for c in all_checks if c not in checked)
+    if problems:
+        status = CorrespondenceStatus.MISMATCHED
+    elif all(c in checked for c in _REQUIRED_CHECKS):
+        status = CorrespondenceStatus.MATCHED
+    else:
+        status = CorrespondenceStatus.INSUFFICIENT
+    return CorrespondenceResult(status, tuple(checked), skipped, tuple(problems))
+
+
+def _raise_for(result: CorrespondenceResult, strict: bool) -> None:
+    if result.status in (CorrespondenceStatus.MISMATCHED, CorrespondenceStatus.INVALID):
+        raise GpxCorrespondenceError(result.problems[0])
+    if result.status is CorrespondenceStatus.INSUFFICIENT:
+        missing = ", ".join(c for c in _REQUIRED_CHECKS if c in result.skipped)
+        if strict:
+            raise InsufficientCorrespondenceEvidence(
+                f"insufficient evidence to verify correspondence (not checked: {missing})."
+            )
+        logger.debug("Correspondence: not checked (%s) -- nothing to contradict", missing)
+
+
+def check_gpx_video_correspondence(
+    track,
+    video_creation_time: datetime.datetime | None,
+    video_duration: float,
+    embedded_coord: tuple[float, float] | None = None,
+    tolerances: CorrespondenceTolerances = DEFAULT_TOLERANCES,
+) -> CorrespondenceResult:
+    """Run the full gate and report what happened instead of raising.
+
+    Same inputs and checks as :func:`assert_gpx_video_correspondence`. Never
+    raises on a mismatch. ``MATCHED`` means both time checks ran and passed;
+    a missing track, video clock, or ``video_duration`` of ``0`` yields
+    ``INSUFFICIENT``; a negative, NaN or infinite duration, non-finite track
+    time, or a track whose last fix precedes its first yields ``INVALID``.
+    """
+    return _evaluate(
+        track,
+        video_creation_time,
+        video_duration,
+        embedded_coord,
+        tolerances,
+        is_slice=False,
+    )
+
+
+def check_slice_gpx_correspondence(
+    track,
+    video_creation_time: datetime.datetime | None,
+    video_duration: float,
+    tolerances: CorrespondenceTolerances = DEFAULT_TOLERANCES,
+) -> CorrespondenceResult:
+    """Slice-gate counterpart of :func:`check_gpx_video_correspondence`."""
+    return _evaluate(track, video_creation_time, video_duration, None, tolerances, is_slice=True)
 
 
 def assert_gpx_video_correspondence(
@@ -61,6 +294,8 @@ def assert_gpx_video_correspondence(
     video_duration: float,
     embedded_coord: tuple[float, float] | None = None,
     tolerances: CorrespondenceTolerances = DEFAULT_TOLERANCES,
+    *,
+    strict: bool = False,
 ) -> None:
     """Raise unless ``track`` plausibly belongs to the video described.
 
@@ -77,6 +312,16 @@ def assert_gpx_video_correspondence(
        the first fix must be within
        ``tolerances.embedded_coord_radius_km`` of it.
 
+    Unusable timing (negative, NaN or infinite ``video_duration``, a
+    non-finite or reversed track, a non-finite embedded coordinate) raises
+    rather than being skipped.
+
+    By default a missing input (no track, no video clock, ``video_duration``
+    of ``0``) skips the affected check and returns quietly. That is a
+    compatibility path, not verification. Pass ``strict=True`` to raise
+    :class:`InsufficientCorrespondenceEvidence` instead, or call
+    :func:`check_gpx_video_correspondence` for the structured result.
+
     Args:
         track: Anything with a ``trackpoints`` list of objects carrying
             ``lat``, ``lon``, and ``timestamp`` (epoch seconds).
@@ -85,53 +330,17 @@ def assert_gpx_video_correspondence(
         video_duration: Video length in seconds; ``0`` skips the span check.
         embedded_coord: ``(lat, lon)`` from the container tag, if any.
         tolerances: How much drift to accept.
+        strict: Raise when the start-time or span check could not run.
 
     Raises:
-        GpxCorrespondenceError: On a genuine mismatch.
+        GpxCorrespondenceError: On a genuine mismatch or unusable timing.
+        InsufficientCorrespondenceEvidence: Only when ``strict`` and a time
+            check could not run.
     """
-    trackpoints = _trackpoints(track)
-    if not trackpoints:
-        logger.debug("Correspondence: no trackpoints -- nothing to check")
-        return
-
-    gpx_start = trackpoints[0].timestamp
-    gpx_span = trackpoints[-1].timestamp - gpx_start
-
-    if video_creation_time is not None:
-        start_delta = abs(gpx_start - video_creation_time.timestamp())
-        if start_delta > tolerances.start_time_sec:
-            raise GpxCorrespondenceError(
-                f"GPX start-time is off by {start_delta / 60:.0f} min "
-                f"(tolerance {tolerances.start_time_sec / 60:.0f} min) from the video's "
-                "creation_time -- the track probably belongs to a different recording."
-            )
-
-    if video_duration and video_duration > 0:
-        span_delta = abs(gpx_span - video_duration)
-        span_tol = max(tolerances.span_abs_sec, tolerances.span_rel * video_duration)
-        if span_delta > span_tol:
-            raise GpxCorrespondenceError(
-                f"GPX span {gpx_span:.0f}s diverges from video duration {video_duration:.0f}s "
-                f"by {span_delta:.0f}s (tolerance {span_tol:.0f}s) -- the track probably "
-                "belongs to a different recording."
-            )
-
-    if embedded_coord is None:
-        logger.debug("Correspondence: no embedded coordinate -- time checks only")
-        return
-
-    elat, elon = embedded_coord
-    flat = trackpoints[0].lat
-    flon = trackpoints[0].lon
-    if flat is None or flon is None:
-        return
-    dist_km = haversine_km(flat, flon, elat, elon)
-    if dist_km > tolerances.embedded_coord_radius_km:
-        raise GpxCorrespondenceError(
-            f"GPX first fix is {dist_km:.0f} km from the video's embedded location tag "
-            f"(tolerance {tolerances.embedded_coord_radius_km:.0f} km) -- the track "
-            "probably belongs to a different recording."
-        )
+    result = check_gpx_video_correspondence(
+        track, video_creation_time, video_duration, embedded_coord, tolerances
+    )
+    _raise_for(result, strict)
 
 
 def assert_slice_gpx_correspondence(
@@ -139,6 +348,8 @@ def assert_slice_gpx_correspondence(
     video_creation_time: datetime.datetime | None,
     video_duration: float,
     tolerances: CorrespondenceTolerances = DEFAULT_TOLERANCES,
+    *,
+    strict: bool = False,
 ) -> None:
     """Raise unless a *window* of a parent track matches the segment cut from it.
 
@@ -158,35 +369,16 @@ def assert_slice_gpx_correspondence(
       started. Checking it would reject every slice of every recording
       that went anywhere.
 
+    ``strict`` and the handling of unusable timing are as for
+    :func:`assert_gpx_video_correspondence`.
+
     Raises:
-        GpxCorrespondenceError: On a genuine mismatch.
+        GpxCorrespondenceError: On a genuine mismatch or unusable timing.
+        InsufficientCorrespondenceEvidence: Only when ``strict`` and a time
+            check could not run.
     """
-    trackpoints = _trackpoints(track)
-    if not trackpoints:
-        logger.debug("Slice correspondence: no trackpoints -- nothing to check")
-        return
-
-    gpx_start = trackpoints[0].timestamp
-    gpx_span = trackpoints[-1].timestamp - gpx_start
-
-    if video_creation_time is not None:
-        start_delta = abs(gpx_start - video_creation_time.timestamp())
-        if start_delta > tolerances.start_time_sec:
-            raise GpxCorrespondenceError(
-                f"Sliced GPX start-time is off by {start_delta / 60:.0f} min "
-                f"(tolerance {tolerances.start_time_sec / 60:.0f} min) from the slice's "
-                "creation_time -- the slice looks mis-anchored to its video."
-            )
-
-    if video_duration and video_duration > 0:
-        over = gpx_span - video_duration
-        span_tol = max(tolerances.span_abs_sec, tolerances.span_rel * video_duration)
-        if over > span_tol:
-            raise GpxCorrespondenceError(
-                f"Sliced GPX span {gpx_span:.0f}s over-covers video duration "
-                f"{video_duration:.0f}s by {over:.0f}s (tolerance {span_tol:.0f}s) -- the "
-                "slice window reached past its own extent."
-            )
+    result = check_slice_gpx_correspondence(track, video_creation_time, video_duration, tolerances)
+    _raise_for(result, strict)
 
 
 def gps_coverage_window(
@@ -225,6 +417,8 @@ def resolve_corresponding_gpx(
     explicit_gpx: Path | None = None,
     video_duration: float = 0.0,
     tolerances: CorrespondenceTolerances = DEFAULT_TOLERANCES,
+    *,
+    strict: bool = False,
 ) -> Path | None:
     """Pick a GPX for ``video_path``, or return ``None`` rather than guess.
 
@@ -241,7 +435,10 @@ def resolve_corresponding_gpx(
     2. An exact ``<video-stem>.gpx`` beside the video. Trusted by name.
     3. Any other ``*.gpx`` in the same folder, but only if it passes
        :func:`assert_gpx_video_correspondence` against this video. First
-       one that passes wins; the rest are refused with a warning.
+       one that passes wins; the rest are refused with a warning. With
+       ``strict=True`` a candidate that could not be verified (no video
+       clock, or ``video_duration`` of ``0``) is refused too, rather than
+       adopted on the strength of the checks that happened to run.
 
     Returns:
         A path that exists and is trustworthy, or ``None``.
@@ -275,6 +472,7 @@ def resolve_corresponding_gpx(
                 video_duration,
                 embedded_coord=embedded,
                 tolerances=tolerances,
+                strict=strict,
             )
         except GpxCorrespondenceError as exc:
             logger.warning("  Refusing GPX %s -- no correspondence: %s", candidate.name, exc)

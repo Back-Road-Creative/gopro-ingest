@@ -134,7 +134,30 @@ except GpxCorrespondenceError as e:
     print(f"refusing this track: {e}")
 ```
 
-Or let it choose for you, and return nothing rather than guess:
+`assert_*` returns quietly when an input is missing (no track, no video clock,
+`video_duration=0`), which looks the same as "checked and fine". To tell them
+apart, ask for the structured result, or make the assert strict:
+
+```python
+from gopro_ingest import CorrespondenceStatus, check_gpx_video_correspondence
+
+result = check_gpx_video_correspondence(track, creation_time, duration)
+result.status  # matched | mismatched | insufficient | invalid
+result.checked  # e.g. ("start_time", "span")
+result.skipped  # e.g. ("position",)
+result.verified  # True only for matched
+
+assert_gpx_video_correspondence(track, creation_time, duration, strict=True)
+# raises InsufficientCorrespondenceEvidence instead of passing on missing input
+```
+
+`matched` needs both time checks to have run; the position check is extra
+evidence. Negative, NaN or infinite durations and reversed or non-finite track
+times are `invalid` (and raise from the `assert_*` functions even without
+`strict`) because they would otherwise compare as "not different" and pass.
+
+Or let it choose for you, and return nothing rather than guess
+(`strict=True` also refuses a candidate that could not be verified):
 
 ```python
 from gopro_ingest import resolve_corresponding_gpx

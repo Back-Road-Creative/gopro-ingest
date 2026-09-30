@@ -1,17 +1,22 @@
 """The gates that refuse a track belonging to a different recording."""
 
+import math
 from datetime import UTC, datetime
 
 import pytest
 from conftest import CREATION, LAT_A, LAT_B, LON_A, LON_B, T0, gpx_text, make_track
 
 from gopro_ingest import (
+    CorrespondenceStatus,
     CorrespondenceTolerances,
     GpxCorrespondenceError,
+    InsufficientCorrespondenceEvidence,
     Track,
     TrackPoint,
     assert_gpx_video_correspondence,
     assert_slice_gpx_correspondence,
+    check_gpx_video_correspondence,
+    check_slice_gpx_correspondence,
     gps_coverage_window,
     resolve_corresponding_gpx,
 )
@@ -147,6 +152,156 @@ class TestCoverageWindow:
         assert gps_coverage_window(Track(), CREATION) is None
 
 
+class TestCheckResult:
+    """The structured result keeps "verified" and "could not check" apart."""
+
+    def test_valid_pair_is_matched_with_both_time_checks(self):
+        result = check_gpx_video_correspondence(
+            make_track(T0 + 5, 600), CREATION, video_duration=600.0
+        )
+        assert result.status is CorrespondenceStatus.MATCHED
+        assert result.verified
+        assert result.checked == ("start_time", "span")
+        assert result.skipped == ("position",)
+        assert result.problems == ()
+
+    def test_position_check_is_recorded_when_run(self):
+        result = check_gpx_video_correspondence(
+            make_track(T0, 600), CREATION, 600.0, embedded_coord=(LAT_A, LON_A)
+        )
+        assert result.status is CorrespondenceStatus.MATCHED
+        assert result.checked == ("start_time", "span", "position")
+        assert result.skipped == ()
+
+    def test_mismatch_carries_the_reason(self):
+        result = check_gpx_video_correspondence(
+            make_track(T0 + 2 * 3600, 600), CREATION, video_duration=600.0
+        )
+        assert result.status is CorrespondenceStatus.MISMATCHED
+        assert not result.verified
+        assert "start-time" in result.problems[0]
+
+    @pytest.mark.parametrize(
+        ("track", "creation", "duration", "skipped"),
+        [
+            (Track(), CREATION, 600.0, {"start_time", "span", "position"}),
+            (None, CREATION, 600.0, {"start_time", "span", "position"}),
+            (make_track(T0, 600), None, 600.0, {"start_time", "position"}),
+            (make_track(T0, 600), CREATION, 0.0, {"span", "position"}),
+        ],
+        ids=["empty-track", "no-track", "no-clock", "no-duration"],
+    )
+    def test_missing_input_is_insufficient_not_matched(self, track, creation, duration, skipped):
+        result = check_gpx_video_correspondence(track, creation, duration)
+        assert result.status is CorrespondenceStatus.INSUFFICIENT
+        assert not result.verified
+        assert set(result.skipped) == skipped
+
+    @pytest.mark.parametrize("duration", [-1.0, math.nan, math.inf, -math.inf])
+    def test_bad_duration_is_invalid(self, duration):
+        result = check_gpx_video_correspondence(make_track(T0, 600), CREATION, duration)
+        assert result.status is CorrespondenceStatus.INVALID
+        assert not result.verified
+        assert "duration" in result.problems[0]
+
+    def test_reversed_timestamps_are_invalid(self):
+        result = check_gpx_video_correspondence(
+            make_track(T0 + 600, -600), CREATION, video_duration=600.0
+        )
+        assert result.status is CorrespondenceStatus.INVALID
+        assert "reversed" in result.problems[0]
+
+    @pytest.mark.parametrize("bad", [math.nan, math.inf])
+    def test_nonfinite_track_timestamp_is_invalid(self, bad):
+        track = Track([TrackPoint(LAT_A, LON_A, None, bad), TrackPoint(LAT_A, LON_A, None, T0)])
+        result = check_gpx_video_correspondence(track, CREATION, video_duration=600.0)
+        assert result.status is CorrespondenceStatus.INVALID
+
+    def test_nonfinite_embedded_coord_is_invalid(self):
+        result = check_gpx_video_correspondence(
+            make_track(T0, 600), CREATION, 600.0, embedded_coord=(math.nan, LON_A)
+        )
+        assert result.status is CorrespondenceStatus.INVALID
+
+    def test_invalid_outranks_insufficient(self):
+        """No clock AND a NaN duration: the bad input is the headline."""
+        result = check_gpx_video_correspondence(make_track(T0, 600), None, math.nan)
+        assert result.status is CorrespondenceStatus.INVALID
+
+    def test_slice_result_has_no_position_check(self):
+        result = check_slice_gpx_correspondence(make_track(T0, 600), CREATION, 600.0)
+        assert result.status is CorrespondenceStatus.MATCHED
+        assert result.checked == ("start_time", "span")
+        assert result.skipped == ()
+
+    def test_slice_over_coverage_is_a_mismatch(self):
+        result = check_slice_gpx_correspondence(make_track(T0, 1800), CREATION, 600.0)
+        assert result.status is CorrespondenceStatus.MISMATCHED
+        assert "over-covers" in result.problems[0]
+
+    def test_slice_insufficient_and_invalid(self):
+        assert (
+            check_slice_gpx_correspondence(Track(), CREATION, 600.0).status
+            is CorrespondenceStatus.INSUFFICIENT
+        )
+        assert (
+            check_slice_gpx_correspondence(make_track(T0, 600), CREATION, math.nan).status
+            is CorrespondenceStatus.INVALID
+        )
+
+
+class TestAssertCompatibilityAndStrict:
+    """Legacy asserts keep their degrade-on-missing path; strict closes it."""
+
+    @pytest.mark.parametrize("duration", [-1.0, math.nan, math.inf])
+    def test_nonfinite_or_negative_duration_raises_even_when_not_strict(self, duration):
+        """These used to be silently skipped; NaN made every comparison False."""
+        with pytest.raises(GpxCorrespondenceError, match="duration"):
+            assert_gpx_video_correspondence(make_track(T0, 600), CREATION, duration)
+        with pytest.raises(GpxCorrespondenceError, match="duration"):
+            assert_slice_gpx_correspondence(make_track(T0, 600), CREATION, duration)
+
+    def test_reversed_track_raises_even_when_not_strict(self):
+        with pytest.raises(GpxCorrespondenceError, match="reversed"):
+            assert_gpx_video_correspondence(make_track(T0 + 600, -600), CREATION, 600.0)
+
+    def test_nan_track_timestamp_no_longer_passes_silently(self):
+        track = Track(
+            [TrackPoint(LAT_A, LON_A, None, math.nan), TrackPoint(LAT_A, LON_A, None, T0)]
+        )
+        with pytest.raises(GpxCorrespondenceError):
+            assert_gpx_video_correspondence(track, CREATION, 600.0)
+
+    @pytest.mark.parametrize(
+        ("track", "creation", "duration"),
+        [
+            (Track(), CREATION, 600.0),
+            (None, CREATION, 600.0),
+            (make_track(T0, 600), None, 600.0),
+            (make_track(T0, 600), CREATION, 0.0),
+        ],
+        ids=["empty-track", "no-track", "no-clock", "no-duration"],
+    )
+    def test_strict_refuses_insufficient_evidence(self, track, creation, duration):
+        with pytest.raises(InsufficientCorrespondenceEvidence, match="insufficient"):
+            assert_gpx_video_correspondence(track, creation, duration, strict=True)
+        with pytest.raises(InsufficientCorrespondenceEvidence):
+            assert_slice_gpx_correspondence(track, creation, duration, strict=True)
+
+    def test_insufficient_error_is_a_correspondence_error(self):
+        assert issubclass(InsufficientCorrespondenceEvidence, GpxCorrespondenceError)
+
+    def test_strict_accepts_a_fully_checked_pair(self):
+        assert_gpx_video_correspondence(make_track(T0, 600), CREATION, 600.0, strict=True)
+        assert_slice_gpx_correspondence(make_track(T0, 600), CREATION, 600.0, strict=True)
+
+    def test_strict_still_raises_the_mismatch_message(self):
+        with pytest.raises(GpxCorrespondenceError, match="start-time"):
+            assert_gpx_video_correspondence(
+                make_track(T0 + 2 * 3600, 600), CREATION, 600.0, strict=True
+            )
+
+
 @pytest.fixture
 def stub_probe(monkeypatch):
     """Stand in for the ffprobe-backed readers so no real MP4 is needed."""
@@ -206,6 +361,18 @@ class TestResolveCorrespondingGpx:
         video = tmp_path / "myclip.mp4"
         video.touch()
         assert resolve_corresponding_gpx(video, video_duration=600.0) is None
+
+    def test_strict_refuses_a_candidate_it_cannot_verify(self, tmp_path, monkeypatch):
+        """No video clock: a lenient glob adopts on span alone; strict does not."""
+        monkeypatch.setattr("gopro_ingest.probe.extract_recording_date", lambda _p: None)
+        monkeypatch.setattr("gopro_ingest.probe.extract_location_coords", lambda _p: None)
+        video = tmp_path / "myclip.mp4"
+        video.touch()
+        candidate = tmp_path / "randomname.gpx"
+        candidate.write_text(gpx_text(T0 + 5, 600))
+
+        assert resolve_corresponding_gpx(video, video_duration=600.0) == candidate
+        assert resolve_corresponding_gpx(video, video_duration=600.0, strict=True) is None
 
     def test_unparseable_candidate_is_skipped_not_fatal(self, tmp_path, stub_probe):
         video = tmp_path / "myclip.mp4"
