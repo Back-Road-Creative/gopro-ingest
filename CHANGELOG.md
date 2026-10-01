@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- `check_gpx_video_correspondence` / `check_slice_gpx_correspondence` return a
+  `CorrespondenceResult` (`matched`, `mismatched`, `insufficient`, `invalid`,
+  plus `checked` / `skipped` checks) so a skipped check is no longer
+  indistinguishable from a passed one. `assert_*` and
+  `resolve_corresponding_gpx` take `strict=True` to refuse insufficient
+  evidence (`InsufficientCorrespondenceEvidence`).
+
+### Fixed
+
+- The `assert_*` gates now raise on a negative, NaN or infinite video
+  duration, a reversed or non-finite track, and a non-finite embedded
+  coordinate. Previously these were skipped or compared as false and passed.
+
 ## 0.1.0
 
 First release.
